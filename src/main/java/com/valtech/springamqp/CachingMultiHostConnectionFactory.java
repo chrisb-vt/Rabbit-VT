@@ -1,0 +1,462 @@
+// Copyright (c) 2012 VocaLink Ltd
+package com.valtech.springamqp;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.LinkedList;
+import java.util.List;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.AmqpException;
+import org.springframework.amqp.rabbit.connection.ChannelProxy;
+import org.springframework.amqp.rabbit.connection.Connection;
+import org.springframework.amqp.rabbit.connection.ConnectionListener;
+import org.springframework.amqp.rabbit.connection.ConnectionProxy;
+import org.springframework.amqp.rabbit.connection.RabbitUtils;
+import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
+
+import com.rabbitmq.client.Address;
+import com.rabbitmq.client.Channel;
+
+/**
+ * A {@link org.springframework.amqp.rabbit.connection.ConnectionFactory} implementation that returns the same Connections from all {@link #createConnection()}
+ * calls, and ignores calls to {@link com.rabbitmq.client.Connection#close()} and caches
+ * {@link Channel}.
+ *
+ * <p>
+ * By default, only one Channel will be cached, with further requested Channels being created and disposed on demand.
+ * Consider raising the {@link #setChannelCacheSize(int) "channelCacheSize" value} in case of a high-concurrency
+ * environment.
+ *
+ * <p>
+ * <b>NOTE: This ConnectionFactory requires explicit closing of all Channels obtained form its shared Connection.</b>
+ * This is the usual recommendation for native Rabbit access code anyway. However, with this ConnectionFactory, its use
+ * is mandatory in order to actually allow for Channel reuse.
+ *
+ * @author Mark Pollack
+ * @author Mark Fisher
+ * @author Dave Syer
+ * @author Dean Bennett
+ */
+public class CachingMultiHostConnectionFactory extends AbstractMultiHostConnectionFactory {
+    // CHECKSTYLE:OFF  This is a modified version of the CachingConnectionFactory from spring-amqp 1.0.0.RC1 to enable configuration of multiple hosts
+
+    private static final Logger logger = LoggerFactory.getLogger(CachingMultiHostConnectionFactory.class);
+
+    private int channelCacheSize = 1;
+
+    private final LinkedList<ChannelProxy> cachedChannelsNonTransactional = new LinkedList<ChannelProxy>();
+
+    private final LinkedList<ChannelProxy> cachedChannelsTransactional = new LinkedList<ChannelProxy>();
+
+    private volatile boolean active = true;
+
+    private ChannelCachingConnectionProxy connection;
+
+    /** Synchronization monitor for the shared Connection */
+    private final Object connectionMonitor = new Object();
+
+    /**
+     * Create a new CachingConnectionFactory initializing the hostname to be the value returned from
+     * InetAddress.getLocalHost(), or "localhost" if getLocalHost() throws an exception.
+     */
+    public CachingMultiHostConnectionFactory() {
+        this((String) null, false);
+    }
+
+    /**
+     * Create a new CachingConnectionFactory given a host name.
+     *
+     * @param hostString the host name or host addresses to connect to
+     * @param port the port to connect to
+     * @param multiHost set flag to indicate multi host string
+     */
+    public CachingMultiHostConnectionFactory(String hostString, int port, boolean multiHost) {
+        super(new com.rabbitmq.client.ConnectionFactory());
+        String hosts = hostString;
+        int serverPort = port;
+        if (!StringUtils.hasText(hostString)) {
+            hosts = getDefaultHostName();
+        }
+        if (multiHost) {
+            setHostString(hosts);
+        } else {
+            Address[] addresses = Address.parseAddresses(hostString);
+            if (addresses.length > 1) {
+                logger.warn("Multi host false but more than one host specified {} {}", hosts, addresses[0].getHost());
+            }
+            setHost(addresses[0].getHost());
+            if (addresses[0].getPort() != -1) {
+                serverPort = port;
+            }
+        }
+        setPort(serverPort);
+    }
+
+    /**
+     * Create a new CachingConnectionFactory given a host name.
+     *
+     * @param port the port to connect to
+     */
+    public CachingMultiHostConnectionFactory(int port) {
+        this(null, port, false);
+    }
+
+    /**
+     * Create a new CachingConnectionFactory given a host name.
+     *
+     * @param hostString the host name or addresses to connect to
+     * @param multiHost set flag to indicate multi host string
+     */
+    public CachingMultiHostConnectionFactory(String hostString, boolean multiHost) {
+        this(hostString, com.rabbitmq.client.ConnectionFactory.DEFAULT_AMQP_PORT, multiHost);
+    }
+
+    /**
+     * Create a new CachingConnectionFactory for the given target ConnectionFactory.
+     *
+     * @param rabbitConnectionFactory the target ConnectionFactory
+     */
+    public CachingMultiHostConnectionFactory(com.rabbitmq.client.ConnectionFactory rabbitConnectionFactory) {
+        super(rabbitConnectionFactory);
+    }
+
+    /**
+     * Set channel cache size
+     * @param sessionCacheSize cache size
+     */
+    public void setChannelCacheSize(int sessionCacheSize) {
+        Assert.isTrue(sessionCacheSize >= 1, "Channel cache size must be 1 or higher");
+        this.channelCacheSize = sessionCacheSize;
+    }
+
+    public int getChannelCacheSize() {
+        return this.channelCacheSize;
+    }
+
+    /**
+     * Set connection listeners notifying if connection is alive
+     * @param listeners connection listeners
+     */
+    public void setConnectionListeners(List<? extends ConnectionListener> listeners) {
+        super.setConnectionListeners(listeners);
+        // If the connection is already alive we assume that the new listeners want to be notified
+        if (this.connection != null) {
+            this.getConnectionListener().onCreate(this.connection);
+        }
+    }
+
+    /**
+     * Add connection listener notifying if connection if connection is alive
+     * @param listener add connection listeners
+     */
+    public void addConnectionListener(ConnectionListener listener) {
+        super.addConnectionListener(listener);
+        // If the connection is already alive we assume that the new listener wants to be notified
+        if (this.connection != null) {
+            listener.onCreate(this.connection);
+        }
+    }
+
+    private Channel getChannel(boolean transactional) {
+        LinkedList<ChannelProxy> channelList = transactional ? this.cachedChannelsTransactional
+                : this.cachedChannelsNonTransactional;
+        Channel channel = null;
+        synchronized (channelList) {
+            if (!channelList.isEmpty()) {
+                channel = channelList.removeFirst();
+            }
+        }
+        if (channel != null) {
+            if (logger.isTraceEnabled()) {
+                logger.trace("Found cached Rabbit Channel");
+            }
+        } else {
+            channel = getCachedChannelProxy(channelList, transactional);
+        }
+        return channel;
+    }
+
+    private ChannelProxy getCachedChannelProxy(LinkedList<ChannelProxy> channelList, boolean transactional) {
+        Channel targetChannel = createBareChannel(transactional);
+        if (logger.isDebugEnabled()) {
+            logger.debug("Creating cached Rabbit Channel from " + targetChannel);
+        }
+        getChannelListener().onCreate(targetChannel, transactional);
+        return (ChannelProxy) Proxy.newProxyInstance(ChannelProxy.class.getClassLoader(),
+                new Class[] {ChannelProxy.class }, new CachedChannelInvocationHandler(targetChannel, channelList,
+                        transactional));
+    }
+
+    private Channel createBareChannel(boolean transactional) {
+        if (this.connection == null || !this.connection.isOpen()) {
+            this.connection = null;
+            // Use createConnection here not doCreateConnection so that the old one is properly disposed
+            createConnection();
+        }
+        return this.connection.createBareChannel(transactional);
+    }
+
+    /**
+     * Create connection
+     * @return connection
+     * @throws AmqpException unable to establish connection
+     */
+    public final Connection createConnection() throws AmqpException {
+        synchronized (this.connectionMonitor) {
+            if (this.connection == null) {
+                this.connection = new ChannelCachingConnectionProxy(super.createBareConnection());
+                // invoke the listener *after* this.connection is assigned
+                getConnectionListener().onCreate(connection);
+            }
+        }
+        return this.connection;
+    }
+
+    /**
+     * Close the underlying shared connection. The provider of this ConnectionFactory needs to care for proper shutdown.
+     * <p>
+     * As this bean implements DisposableBean, a bean factory will automatically invoke this on destruction of its
+     * cached singletons.
+     */
+    public final void destroy() {
+        synchronized (this.connectionMonitor) {
+            if (connection != null) {
+                this.connection.destroy();
+                this.connection = null;
+            }
+        }
+        reset();
+    }
+
+    /**
+     * Reset the Channel cache and underlying shared Connection, to be reinitialized on next access.
+     */
+    protected void reset() {
+        this.active = false;
+        synchronized (this.cachedChannelsNonTransactional) {
+            for (ChannelProxy channel : cachedChannelsNonTransactional) {
+                try {
+                    channel.getTargetChannel().close();
+                } catch (Throwable ex) {
+                    logger.trace("Could not close cached Rabbit Channel", ex);
+                }
+            }
+            this.cachedChannelsNonTransactional.clear();
+        }
+        synchronized (this.cachedChannelsTransactional) {
+            for (ChannelProxy channel : cachedChannelsTransactional) {
+                try {
+                    channel.getTargetChannel().close();
+                } catch (Throwable ex) {
+                    logger.trace("Could not close cached Rabbit Channel", ex);
+                }
+            }
+            this.cachedChannelsTransactional.clear();
+        }
+        this.active = true;
+        this.connection = null;
+    }
+
+    @Override
+    public String toString() {
+        return "CachingMultiHostConnectionFactory [channelCacheSize=" + channelCacheSize + ", host=" + (this.getHost())
+                + ", port=" + this.getPort() + ", active=" + active + "]";
+    }
+
+    /**
+     * Invocation handler for cached channel
+     */
+    private class CachedChannelInvocationHandler implements InvocationHandler {
+
+        private volatile Channel target;
+
+        private final LinkedList<ChannelProxy> channelList;
+
+        private final Object targetMonitor = new Object();
+
+        private final boolean transactional;
+
+        public CachedChannelInvocationHandler(Channel target, LinkedList<ChannelProxy> channelList,
+                boolean transactional) {
+            this.target = target;
+            this.channelList = channelList;
+            this.transactional = transactional;
+        }
+
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            String methodName = method.getName();
+            if (methodName.equals("txSelect") && !this.transactional) {
+                throw new UnsupportedOperationException("Cannot start transaction on non-transactional channel");
+            }
+            if (methodName.equals("equals")) {
+                // Only consider equal when proxies are identical.
+                return proxy == args[0];
+            } else if (methodName.equals("hashCode")) {
+                // Use hashCode of Channel proxy.
+                return System.identityHashCode(proxy);
+            } else if (methodName.equals("toString")) {
+                return "Cached Rabbit Channel: " + this.target;
+            } else if (methodName.equals("close")) {
+                // Handle close method: don't pass the call on.
+                if (active) {
+                    synchronized (this.channelList) {
+                        if (this.channelList.size() < getChannelCacheSize()) {
+                            logicalClose((ChannelProxy) proxy);
+                            // Remain open in the channel list.
+                            return null;
+                        }
+                    }
+                }
+
+                // If we get here, we're supposed to shut down.
+                physicalClose();
+                return null;
+            } else if (methodName.equals("getTargetChannel")) {
+                // Handle getTargetChannel method: return underlying Channel.
+                return this.target;
+            }
+            try {
+                if (this.target == null || !this.target.isOpen()) {
+                    this.target = null;
+                    synchronized (targetMonitor) {
+                        if (this.target == null) {
+                            this.target = createBareChannel(transactional);
+                        }
+                    }
+                }
+                return method.invoke(this.target, args);
+            } catch (InvocationTargetException ex) {
+                if (!this.target.isOpen()) {
+                    // Basic re-connection logic...
+                    logger.debug("Detected closed channel on exception.  Re-initializing: " + target);
+                    synchronized (targetMonitor) {
+                        if (!this.target.isOpen()) {
+                            this.target = createBareChannel(transactional);
+                        }
+                    }
+                }
+                throw ex.getTargetException();
+            }
+        }
+
+        /**
+         * GUARDED by channelList
+         *
+         * @param proxy the channel to close
+         */
+        private void logicalClose(ChannelProxy proxy) {
+            if (this.target != null && !this.target.isOpen()) {
+                synchronized (targetMonitor) {
+                    if (this.target != null && !this.target.isOpen()) {
+                        this.target = null;
+                        return;
+                    }
+                }
+            }
+            // Allow for multiple close calls...
+            if (!this.channelList.contains(proxy)) {
+                if (logger.isTraceEnabled()) {
+                    logger.trace("Returning cached Channel: " + this.target);
+                }
+                this.channelList.addLast(proxy);
+            }
+        }
+
+        private void physicalClose() throws Exception {
+            if (logger.isDebugEnabled()) {
+                logger.debug("Closing cached Channel: " + this.target);
+            }
+            if (this.target == null) {
+                return;
+            }
+            if (this.target.isOpen()) {
+                synchronized (targetMonitor) {
+                    if (this.target.isOpen()) {
+                        this.target.close();
+                    }
+                    this.target = null;
+                }
+            }
+        }
+
+    }
+
+    /**
+     * Proxy class for cached connection and channel
+     */
+    private class ChannelCachingConnectionProxy implements Connection, ConnectionProxy {
+
+        private volatile Connection target;
+
+        public ChannelCachingConnectionProxy(Connection target) {
+            this.target = target;
+        }
+
+        private Channel createBareChannel(boolean transactional) {
+            return target.createChannel(transactional);
+        }
+
+        public Channel createChannel(boolean transactional) {
+            return getChannel(transactional);
+        }
+
+        public void close() {
+        }
+
+        public void destroy() {
+            if (this.target != null) {
+                getConnectionListener().onClose(target);
+                RabbitUtils.closeConnection(this.target);
+            }
+            reset();
+            this.target = null;
+        }
+
+        public boolean isOpen() {
+            return target != null && target.isOpen();
+        }
+
+        public Connection getTargetConnection() {
+            return target;
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 + ((target == null) ? 0 : target.hashCode());
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (obj == null) {
+                return false;
+            }
+            if (getClass() != obj.getClass()) {
+                return false;
+            }
+            ChannelCachingConnectionProxy other = (ChannelCachingConnectionProxy) obj;
+            if (target == null) {
+                if (other.target != null) {
+                    return false;
+                }
+            } else if (!target.equals(other.target)) {
+                return false;
+            }
+            return true;
+        }
+
+        @Override
+        public String toString() {
+            return "Shared Rabbit Connection: " + this.target;
+        }
+
+    }
+    // CHECKSTYLE:ON
+}
