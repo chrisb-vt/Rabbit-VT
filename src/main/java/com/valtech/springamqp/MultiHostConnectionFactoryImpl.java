@@ -10,7 +10,7 @@ import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
  * @author Dean Bennett
  */
 public class MultiHostConnectionFactoryImpl extends CachingConnectionFactory implements MultiHostConnectionFactory {
-    // This is a modified version of the CachingConnectionFactory from spring-amqp 1.1.4.RELEASE to allow the addition of a broker alias
+    // This is a modified version of the CachingConnectionFactory from spring-amqp 1.2.0.RELEASE to allow the addition of a broker alias
 
     /** Displayable name of the broker **/
     private String brokerAlias;
@@ -18,10 +18,19 @@ public class MultiHostConnectionFactoryImpl extends CachingConnectionFactory imp
     /**
      * Default Constructor
      */
-    public MultiHostConnectionFactoryImpl() {
-        super();
-    }
+    public MultiHostConnectionFactoryImpl() {}
 
+    /**
+     * Create a new MultiHostConnectionFactoryImpl for the given host and port.
+     *
+     * @param host the target rabbit server
+     * @param port the target port
+     */
+    public MultiHostConnectionFactoryImpl(String host, int port)
+    {
+      super(host, port);
+    }    
+    
     /**
      * Create a new MultiHostConnectionFactoryImpl for the given target ConnectionFactory.
      *
@@ -31,6 +40,25 @@ public class MultiHostConnectionFactoryImpl extends CachingConnectionFactory imp
         super(rabbitConnectionFactory);
     }
 
+    /**
+     * Set addresses for clustering.
+     * @param addresses list of addresses with form "host[:port],..."
+     */
+    public void setAddresses(String addresses)
+    {
+      super.setAddresses(addresses);
+      String firstAddress = addresses.split(",")[0];
+      String[] addressParts = firstAddress.split(":");
+      String firstHost = addressParts[0];
+      
+      int firstPort = 0;
+      if (addressParts.length > 1) {
+        firstPort = Integer.parseInt(addressParts[1]);
+      }
+      super.setHost(firstHost);
+      super.setPort(firstPort);
+    }
+    
     /**
      * {@inheritdoc }
      */
@@ -49,4 +77,5 @@ public class MultiHostConnectionFactoryImpl extends CachingConnectionFactory imp
     public String toString() {
         return "MultiHostConnectionFactoryImpl [host=" + getHost() + ", port=" + getPort() + "]";
     }
+    
 }
